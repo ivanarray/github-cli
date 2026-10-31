@@ -44,6 +44,9 @@ type LoginOptions struct {
 	SkipSSHKeyPrompt bool
 	Expiring         *bool
 	Clipboard        *bool
+	AppID            int64
+	InstallationID   int64
+	PrivateKeyFile   string
 
 	// AuthFlow is indirected so tests can stub the interactive authorization. When nil, the shared login flow uses
 	// the real authflow.AuthFlow.
@@ -96,6 +99,12 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 
 			To use gh in GitHub Actions, add %[1]sGH_TOKEN: ${{ github.token }}%[1]s to %[1]senv%[1]s.
 
+			Alternatively, use %[1]s--app-id%[1]s, %[1]s--installation-id%[1]s, and %[1]s--private-key-file%[1]s together
+			to authenticate as an installation of a GitHub App. Only the path of the private key is stored,
+			so the file must stay in place for gh to renew the installation token, which expires after one
+			hour. The app's %[1]sNAME[bot]%[1]s account becomes the active account on the host; use
+			%[1]sgh auth switch%[1]s to go back to another account.
+
 			The git protocol to use for git operations on this host can be set with %[1]s--git-protocol%[1]s,
 			or during the interactive prompting. Although login is for a single account on a host, setting
 			the git protocol will take effect for all users on the host.
@@ -130,6 +139,9 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 
 			# Authenticate with specific host
 			$ gh auth login --hostname enterprise.internal
+
+			# Authenticate as an installation of a GitHub App
+			$ gh auth login --app-id 123 --installation-id 456 --private-key-file app.pem
 		`),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.Telemetry != nil {
@@ -145,6 +157,12 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 			if tokenStdin && opts.Expiring != nil && *opts.Expiring {
 				return cmdutil.FlagErrorf("specify only one of `--expiring` or `--with-token`")
 			}
+			if cmd.Flags().Changed("app-id") && (opts.AppID <= 0 || opts.InstallationID <= 0) {
+				return cmdutil.FlagErrorf("`--app-id` and `--installation-id` must be positive numbers")
+			}
+			if opts.AppID != 0 && (tokenStdin || opts.Web || len(opts.Scopes) > 0 || opts.Expiring != nil) {
+				return cmdutil.FlagErrorf("`--app-id` cannot be combined with `--with-token`, `--web`, `--scopes`, or `--expiring`")
+			}
 
 			if tokenStdin {
 				defer opts.IO.In.Close()
@@ -155,7 +173,7 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 				opts.Token = strings.TrimSpace(string(token))
 			}
 
-			if opts.IO.CanPrompt() && opts.Token == "" {
+			if opts.IO.CanPrompt() && opts.Token == "" && opts.AppID == 0 {
 				opts.Interactive = true
 			}
 
@@ -193,6 +211,10 @@ func NewCmdLogin(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder, r
 	cmd.Flags().BoolVar(&opts.InsecureStorage, "insecure-storage", false, "Save authentication credentials in plain text instead of credential store")
 	cmd.Flags().BoolVar(&opts.SkipSSHKeyPrompt, "skip-ssh-key", false, "Skip generate/upload SSH key prompt")
 	cmdutil.NilBoolFlag(cmd, &opts.Expiring, "expiring", "", "Prefer expiring credentials that gh refreshes automatically, if the host supports them")
+	cmd.Flags().Int64Var(&opts.AppID, "app-id", 0, "The ID of the GitHub App to authenticate as")
+	cmd.Flags().Int64Var(&opts.InstallationID, "installation-id", 0, "The ID of the GitHub App installation to authenticate as")
+	cmd.Flags().StringVar(&opts.PrivateKeyFile, "private-key-file", "", "The path to the private key of the GitHub App")
+	cmd.MarkFlagsRequiredTogether("app-id", "installation-id", "private-key-file")
 
 	return cmd
 }
@@ -247,6 +269,23 @@ func loginRun(opts *LoginOptions) error {
 		// Adding a user key ensures that a nonempty host section gets written to the config file.
 		_, loginErr := authCfg.Login(hostname, username, opts.Token, opts.GitProtocol, !opts.InsecureStorage)
 		return loginErr
+	}
+
+	if opts.AppID != 0 {
+		username, credential, err := authflow.LoginWithApp(plainHTTPClient, hostname, opts.AppID, opts.InstallationID, opts.PrivateKeyFile)
+		if err != nil {
+			return fmt.Errorf("error authenticating as GitHub App: %w", err)
+		}
+		insecureStorageUsed, err := authCfg.LoginRefreshable(hostname, username, credential, opts.GitProtocol, !opts.InsecureStorage)
+		if err != nil {
+			return err
+		}
+		cs := opts.IO.ColorScheme()
+		if insecureStorageUsed {
+			fmt.Fprintf(opts.IO.ErrOut, "%s Authentication credentials saved in plain text\n", cs.Yellow("!"))
+		}
+		fmt.Fprintf(opts.IO.ErrOut, "%s Logged in as %s\n", cs.SuccessIcon(), cs.Bold(username))
+		return nil
 	}
 
 	// Nudge users towards expiring tokens unless they have already expressed a preference, either with the flag or

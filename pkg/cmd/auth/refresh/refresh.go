@@ -194,6 +194,11 @@ func refreshRun(opts *RefreshOptions) error {
 		return cmdutil.SilentError
 	}
 
+	// The browser flow below can only return a person's token, which can never match a GitHub App's bot account.
+	if authflow.IsAppCredential(authCfg.ActiveToken(hostname).RefreshToken) {
+		return fmt.Errorf("gh renews the GitHub App token for %s automatically; to change the app's credentials, run 'gh auth login' with --app-id, --installation-id, and --private-key-file", hostname)
+	}
+
 	cs := opts.IO.ColorScheme()
 
 	// Begin the auth-state telemetry event. It is nil for disabled telemetry or enterprise hosts, and all event methods

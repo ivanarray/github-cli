@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -393,6 +394,33 @@ func Test_statusRun(t *testing.T) {
 				  - Token expires: 2000-01-01T00:00:00Z (expired about 2 days ago)
 				  - Refresh token expires: 2000-01-02T00:00:00Z (expired about 1 day ago)
 				  - To re-authenticate, run: gh auth login -h github.com
+			`),
+		},
+		{
+			name: "failed GitHub App renewal shows the reason and the app login",
+			opts: StatusOptions{},
+			now:  time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC),
+			cfgStubs: func(t *testing.T, c gh.Config) {
+				past := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+				loginRefreshable(t, c, "github.com", "myapp[bot]", "ghs_stale", "ghapp:123:456:/gone/app.pem", &past, nil)
+				setRefresher(t, c, &ghmock.TokenRefresherMock{
+					RefreshFunc: func(string, string) (gh.RefreshableCredential, error) {
+						return gh.RefreshableCredential{}, errors.New("failed to read GitHub App private key")
+					},
+				})
+			},
+			httpStubs: func(reg *httpmock.Registry) {
+				reg.Register(httpmock.REST("GET", ""), httpmock.StatusStringResponse(401, "Bad credentials"))
+			},
+			wantErr: cmdutil.SilentError,
+			wantErrOut: heredoc.Doc(`
+				github.com
+				  X Failed to log in to github.com account myapp[bot] (GH_CONFIG_DIR/hosts.yml)
+				  - Active account: true
+				  - The token in GH_CONFIG_DIR/hosts.yml is invalid.
+				  ! Failed to refresh the token: failed to read GitHub App private key
+				  - To re-authenticate, run: gh auth login -h github.com --app-id APP_ID --installation-id INSTALLATION_ID --private-key-file KEY_FILE
+				  - To forget about this account, run: gh auth logout -h github.com -u myapp[bot]
 			`),
 		},
 		{

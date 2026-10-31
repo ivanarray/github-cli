@@ -12,6 +12,7 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/authflow"
 	"github.com/cli/cli/v2/internal/config"
 	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/text"
@@ -49,6 +50,12 @@ type authEntry struct {
 	// expiredWithoutRefresh reports whether the token check failed because the expiring token had already expired
 	// and --no-refresh kept gh from renewing it. It drives a display-only hint and is never serialized.
 	expiredWithoutRefresh bool
+	// refreshError is why renewing this account's expiring token failed, if it did. It drives a display-only line and
+	// is never serialized.
+	refreshError error
+	// appCredential reports whether this account is a GitHub App installation, which a person cannot re-authenticate
+	// as with the browser flow. It drives a display-only hint and is never serialized.
+	appCredential bool
 }
 
 type authStatus struct {
@@ -140,9 +147,14 @@ func (e authEntry) String(cs *iostreams.ColorScheme) string {
 		activeStr := fmt.Sprintf("%v", e.Active)
 		sb.WriteString(fmt.Sprintf("  - Active account: %s\n", cs.Bold(activeStr)))
 		sb.WriteString(fmt.Sprintf("  - The token in %s is invalid.\n", e.TokenSource))
+		if e.refreshError != nil {
+			sb.WriteString(fmt.Sprintf("  %s Failed to refresh the token: %s\n", cs.WarningIcon(), e.refreshError))
+		}
 		if authTokenWriteable(e.TokenSource) {
 			loginInstructions := fmt.Sprintf("gh auth login -h %s", e.Host)
-			if shared.AuthTokenRefreshable(e.Token, e.TokenSource) {
+			if e.appCredential {
+				loginInstructions += " --app-id APP_ID --installation-id INSTALLATION_ID --private-key-file KEY_FILE"
+			} else if shared.AuthTokenRefreshable(e.Token, e.TokenSource) {
 				loginInstructions = fmt.Sprintf("gh auth refresh -h %s", e.Host)
 			}
 			logoutInstructions := fmt.Sprintf("gh auth logout -h %s -u %s", e.Host, e.Login)
@@ -314,7 +326,7 @@ func statusRun(opts *StatusOptions) error {
 
 		var activeUser string
 		gitProtocol := cfg.GitProtocol(hostname).Value
-		activeCred, activeRefreshStatus := resolveCredential(authCfg, hostname, "", opts.NoRefresh)
+		activeCred, activeRefreshStatus, activeRefreshErr := resolveCredential(authCfg, hostname, "", opts.NoRefresh)
 		if authTokenWriteable(activeCred.Source) {
 			activeUser, _ = authCfg.ActiveUser(hostname)
 		}
@@ -324,6 +336,7 @@ func statusRun(opts *StatusOptions) error {
 			hostname:      hostname,
 			credential:    activeCred,
 			refreshStatus: activeRefreshStatus,
+			refreshErr:    activeRefreshErr,
 			noRefresh:     opts.NoRefresh,
 			username:      activeUser,
 		})
@@ -342,13 +355,14 @@ func statusRun(opts *StatusOptions) error {
 			if username == activeUser {
 				continue
 			}
-			cred, refreshStatus := resolveCredential(authCfg, hostname, username, opts.NoRefresh)
+			cred, refreshStatus, refreshErr := resolveCredential(authCfg, hostname, username, opts.NoRefresh)
 			entry := buildEntry(httpClient, buildEntryOptions{
 				active:        false,
 				gitProtocol:   gitProtocol,
 				hostname:      hostname,
 				credential:    cred,
 				refreshStatus: refreshStatus,
+				refreshErr:    refreshErr,
 				noRefresh:     opts.NoRefresh,
 				username:      username,
 			})
@@ -448,6 +462,7 @@ type buildEntryOptions struct {
 	hostname      string
 	credential    gh.Credential
 	refreshStatus gh.RefreshStatus
+	refreshErr    error
 	noRefresh     bool
 	username      string
 }
@@ -470,6 +485,8 @@ func buildEntry(httpClient *http.Client, opts buildEntryOptions) authEntry {
 		TokenExpiresAt:        opts.credential.ExpiresAt,
 		RefreshTokenExpiresAt: opts.credential.RefreshTokenExpiresAt,
 		justRefreshed:         opts.refreshStatus == gh.RefreshStatusDone,
+		refreshError:          opts.refreshErr,
+		appCredential:         authflow.IsAppCredential(opts.credential.RefreshToken),
 	}
 
 	// A rejected refresh token means the stored credential was already removed during resolution, leaving an empty
@@ -532,19 +549,17 @@ func authTokenWriteable(src string) bool {
 // resolveCredential returns the credential gh should present for the host and optional user (an empty username means the
 // active account), refreshing an expiring token unless noRefresh is set. Refresh is best effort: a failed
 // refresh yields the last stored credential, which the caller still validates via the scope check. The returned status
-// reports whether a refresh happened.
-func resolveCredential(authCfg gh.AuthConfig, hostname, username string, noRefresh bool) (gh.Credential, gh.RefreshStatus) {
+// reports whether a refresh happened, and the error why it failed.
+func resolveCredential(authCfg gh.AuthConfig, hostname, username string, noRefresh bool) (gh.Credential, gh.RefreshStatus, error) {
 	if noRefresh {
 		if username == "" {
-			return authCfg.ActiveToken(hostname), gh.RefreshStatusInapplicable
+			return authCfg.ActiveToken(hostname), gh.RefreshStatusInapplicable, nil
 		}
 		credential, _ := authCfg.TokenForUser(hostname, username)
-		return credential, gh.RefreshStatusInapplicable
+		return credential, gh.RefreshStatusInapplicable, nil
 	}
 	if username == "" {
-		credential, status, _ := authCfg.ActiveTokenWithRefresh(hostname)
-		return credential, status
+		return authCfg.ActiveTokenWithRefresh(hostname)
 	}
-	credential, status, _ := authCfg.TokenForUserWithRefresh(hostname, username)
-	return credential, status
+	return authCfg.TokenForUserWithRefresh(hostname, username)
 }

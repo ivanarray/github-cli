@@ -2,10 +2,17 @@ package login
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
@@ -276,6 +283,58 @@ func Test_NewCmdLogin(t *testing.T) {
 				SkipSSHKeyPrompt: true,
 			},
 		},
+		{
+			name:     "tty, app flags skip prompts and use the default host",
+			stdinTTY: true,
+			cli:      "--app-id 123 --installation-id 456 --private-key-file app.pem",
+			wants: LoginOptions{
+				Hostname:       "github.com",
+				AppID:          123,
+				InstallationID: 456,
+				PrivateKeyFile: "app.pem",
+			},
+		},
+		{
+			name:     "tty, app-id zero does not fall through to the browser flow",
+			stdinTTY: true,
+			cli:      "--app-id 0 --installation-id 456 --private-key-file app.pem",
+			wantsErr: true,
+		},
+		{
+			name:     "negative installation-id",
+			cli:      "--app-id 123 --installation-id -1 --private-key-file app.pem",
+			wantsErr: true,
+		},
+		{
+			name:     "app-id without the other app flags",
+			cli:      "--app-id 123",
+			wantsErr: true,
+		},
+		{
+			name:     "installation-id and private-key-file without app-id",
+			cli:      "--installation-id 456 --private-key-file app.pem",
+			wantsErr: true,
+		},
+		{
+			name:     "app flags and with-token",
+			cli:      "--app-id 123 --installation-id 456 --private-key-file app.pem --with-token",
+			wantsErr: true,
+		},
+		{
+			name:     "app flags and web",
+			cli:      "--app-id 123 --installation-id 456 --private-key-file app.pem --web",
+			wantsErr: true,
+		},
+		{
+			name:     "app flags and scopes",
+			cli:      "--app-id 123 --installation-id 456 --private-key-file app.pem --scopes repo",
+			wantsErr: true,
+		},
+		{
+			name:     "app flags and expiring",
+			cli:      "--app-id 123 --installation-id 456 --private-key-file app.pem --expiring=false",
+			wantsErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -328,8 +387,84 @@ func Test_NewCmdLogin(t *testing.T) {
 			assert.Equal(t, tt.wants.Scopes, gotOpts.Scopes)
 			assert.Equal(t, tt.wants.Clipboard, gotOpts.Clipboard)
 			assert.Equal(t, tt.wants.Expiring, gotOpts.Expiring)
+			assert.Equal(t, tt.wants.AppID, gotOpts.AppID)
+			assert.Equal(t, tt.wants.InstallationID, gotOpts.InstallationID)
+			assert.Equal(t, tt.wants.PrivateKeyFile, gotOpts.PrivateKeyFile)
 		})
 	}
+}
+
+func Test_loginRun_app(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	keyPath := filepath.Join(t.TempDir(), "app.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0o600))
+
+	ios, _, stdout, stderr := iostreams.Test()
+	cfg, readConfigs := config.NewIsolatedTestConfig(t, "")
+
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	reg.Register(httpmock.REST("GET", "app"), httpmock.JSONResponse(map[string]any{"slug": "myapp"}))
+	reg.Register(
+		httpmock.REST("POST", "app/installations/456/access_tokens"),
+		httpmock.JSONResponse(map[string]any{"token": "ghs_NEW", "expires_at": "2099-01-01T00:00:00Z"}))
+	httpClient := func() (*http.Client, error) { return &http.Client{Transport: reg}, nil }
+
+	require.NoError(t, loginRun(&LoginOptions{
+		IO:              ios,
+		Config:          func() (gh.Config, error) { return cfg, nil },
+		HttpClient:      httpClient,
+		PlainHttpClient: httpClient,
+		Hostname:        "github.com",
+		AppID:           123,
+		InstallationID:  456,
+		PrivateKeyFile:  keyPath,
+		InsecureStorage: true,
+	}))
+	assert.Empty(t, stdout.String())
+	assert.Equal(t, "! Authentication credentials saved in plain text\n✓ Logged in as myapp[bot]\n", stderr.String())
+
+	// Read the written hosts file back to prove the bot login survives a YAML round trip.
+	hostsBuf := bytes.Buffer{}
+	readConfigs(&bytes.Buffer{}, &hostsBuf)
+	hosts := strings.ReplaceAll(strings.TrimSpace(hostsBuf.String()), "\n", "\n    ")
+	reloaded, _ := config.NewIsolatedTestConfig(t, "hosts:\n    "+hosts+"\n")
+	authCfg := reloaded.Authentication()
+
+	user, err := authCfg.ActiveUser("github.com")
+	require.NoError(t, err)
+	assert.Equal(t, "myapp[bot]", user)
+
+	credential := authCfg.ActiveToken("github.com")
+	assert.Equal(t, "ghs_NEW", credential.Token)
+	assert.Equal(t, "ghapp:123:456:"+keyPath, credential.RefreshToken)
+	assert.True(t, credential.IsRefreshable())
+}
+
+func Test_loginRun_appInvalidKey(t *testing.T) {
+	ios, _, _, _ := iostreams.Test()
+	cfg, readConfigs := config.NewIsolatedTestConfig(t, "")
+	reg := &httpmock.Registry{}
+	defer reg.Verify(t)
+	httpClient := func() (*http.Client, error) { return &http.Client{Transport: reg}, nil }
+
+	err := loginRun(&LoginOptions{
+		IO:              ios,
+		Config:          func() (gh.Config, error) { return cfg, nil },
+		HttpClient:      httpClient,
+		PlainHttpClient: httpClient,
+		Hostname:        "github.com",
+		AppID:           123,
+		InstallationID:  456,
+		PrivateKeyFile:  filepath.Join(t.TempDir(), "missing.pem"),
+	})
+	assert.ErrorContains(t, err, "error authenticating as GitHub App")
+
+	hostsBuf := bytes.Buffer{}
+	readConfigs(&bytes.Buffer{}, &hostsBuf)
+	assert.Empty(t, hostsBuf.String())
 }
 
 func Test_loginRun_nontty(t *testing.T) {

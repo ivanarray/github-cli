@@ -42,7 +42,20 @@ func NewTokenRefresher(httpClient *http.Client) *TokenRefresher {
 // an error wrapping gh.ErrRefreshTokenInvalid, so callers can distinguish an unusable refresh token from a transient
 // failure without depending on the underlying OAuth library. When the server omits a new refresh token, the returned
 // credential keeps refreshToken, since RFC 6749 treats the previous refresh token as still valid in that case.
+//
+// GitHub App credentials are renewed by minting a new installation token instead. Their failures are never reported as
+// gh.ErrRefreshTokenInvalid, because that deletes the stored credential and a missing key file or a network failure
+// should not log the user out.
 func (r *TokenRefresher) Refresh(refreshToken, hostname string) (gh.RefreshableCredential, error) {
+	if IsAppCredential(refreshToken) {
+		requestedAt := timeNow().UTC()
+		token, err := mintInstallationToken(r.httpClient, hostname, refreshToken, requestedAt)
+		if err != nil {
+			return gh.RefreshableCredential{}, err
+		}
+		return refreshableCredentialFromAccessToken(token, requestedAt), nil
+	}
+
 	host, err := oauth.NewGitHubHost(ghinstance.HostPrefix(hostname))
 	if err != nil {
 		return gh.RefreshableCredential{}, err
@@ -73,6 +86,10 @@ func (r *TokenRefresher) Refresh(refreshToken, hostname string) (gh.RefreshableC
 			return gh.RefreshableCredential{}, fmt.Errorf("%w: %w", gh.ErrRefreshTokenInvalid, err)
 		}
 		return gh.RefreshableCredential{}, err
+	}
+	// Storing this would make the next refresh sign a JWT with a local key and send it to this server.
+	if IsAppCredential(token.RefreshToken) {
+		return gh.RefreshableCredential{}, errors.New("the server returned an invalid refresh token")
 	}
 
 	return refreshableCredentialFromAccessToken(token, requestedAt), nil
@@ -117,13 +134,15 @@ func credentialFromAccessToken(token *oauthapi.AccessToken, requestedAt time.Tim
 
 // authResultFromToken projects the OAuth flow's access token and the resolved username onto an AuthResult. A refresh
 // token is present only when the server honored the expiring request, so the refreshable credential is gated on it
-// rather than on requestRefreshToken. requestedAt anchors any expiring token's lifetime.
+// rather than on requestRefreshToken. requestedAt anchors any expiring token's lifetime. A refresh token claiming to be
+// GitHub App credentials is dropped, because storing it would make a refresh sign a JWT with a local key and send it to
+// the server that issued it.
 func authResultFromToken(token *oauthapi.AccessToken, username string, requestedAt time.Time) *AuthResult {
 	result := &AuthResult{
 		Token:    token.Token,
 		Username: username,
 	}
-	if token.RefreshToken != "" {
+	if token.RefreshToken != "" && !IsAppCredential(token.RefreshToken) {
 		credential := credentialFromAccessToken(token, requestedAt)
 		result.Refreshable = &credential
 	}

@@ -1,6 +1,8 @@
 package login
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -13,15 +15,19 @@ type tinyConfig map[string]string
 
 func (c tinyConfig) ActiveTokenWithRefresh(host string) (gh.Credential, gh.RefreshStatus, error) {
 	status := gh.RefreshStatusInapplicable
+	var err error
 	switch c["_refresh_status"] {
 	case "expired":
 		status = gh.RefreshStatusExpired
+	case "failed":
+		status = gh.RefreshStatusFailed
+		err = errors.New("no such key file")
 	}
 	return gh.Credential{
 		Token:        c[fmt.Sprintf("%s:%s", host, "oauth_token")],
 		Source:       c["_source"],
 		RefreshToken: c["_refresh_token"],
-	}, status, nil
+	}, status, err
 }
 
 func (c tinyConfig) ActiveUser(host string) (string, error) {
@@ -86,6 +92,156 @@ func Test_helperRun(t *testing.T) {
 				username=monalisa
 				password=OTOKEN
 			`),
+			wantStderr: "",
+		},
+		{
+			name: "installation token uses x-access-token",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"example.com:user":        "myapp[bot]",
+						"example.com:oauth_token": "ghs_TOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				protocol=https
+				host=example.com
+			`),
+			wantErr: false,
+			wantStdout: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=x-access-token
+				password=ghs_TOKEN
+			`),
+			wantStderr: "",
+		},
+		{
+			name: "installation token served to a remote naming x-access-token",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"example.com:user":        "myapp[bot]",
+						"example.com:oauth_token": "ghs_TOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=x-access-token
+			`),
+			wantErr: false,
+			wantStdout: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=x-access-token
+				password=ghs_TOKEN
+			`),
+			wantStderr: "",
+		},
+		{
+			name: "non-installation token refused for a remote naming x-access-token",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"example.com:user":        "monalisa",
+						"example.com:oauth_token": "OTOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=x-access-token
+			`),
+			wantErr:    true,
+			wantStdout: "",
+			wantStderr: "",
+		},
+		{
+			// A stored app token is always refreshable, so git 2.46+ takes this path.
+			name: "refreshable installation token, authtype capability present",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"_refresh_token":          "ghapp:123:456:/path/to/app.pem",
+						"example.com:user":        "myapp[bot]",
+						"example.com:oauth_token": "ghs_TOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				capability[]=authtype
+				protocol=https
+				host=example.com
+			`),
+			wantErr: false,
+			wantStdout: heredoc.Docf(`
+				capability[]=authtype
+				protocol=https
+				host=example.com
+				username=x-access-token
+				authtype=Basic
+				credential=%s
+				ephemeral=1
+			`, base64.StdEncoding.EncodeToString([]byte("x-access-token:ghs_TOKEN"))),
+			wantStderr: "",
+		},
+		{
+			name: "failed refresh warns and still hands over the token",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"_refresh_status":         "failed",
+						"example.com:user":        "monalisa",
+						"example.com:oauth_token": "OTOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				protocol=https
+				host=example.com
+			`),
+			wantErr: false,
+			wantStdout: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=monalisa
+				password=OTOKEN
+			`),
+			wantStderr: "WARNING: gh: failed to refresh the token for example.com: no such key file\n",
+		},
+		{
+			name: "installation token refused for a different user",
+			opts: CredentialOptions{
+				Operation: "get",
+				Config: func() (config, error) {
+					return tinyConfig{
+						"_source":                 "/Users/monalisa/.config/gh/hosts.yml",
+						"example.com:user":        "myapp[bot]",
+						"example.com:oauth_token": "ghs_TOKEN",
+					}, nil
+				},
+			},
+			input: heredoc.Doc(`
+				protocol=https
+				host=example.com
+				username=hubot
+			`),
+			wantErr:    true,
+			wantStdout: "",
 			wantStderr: "",
 		},
 		{

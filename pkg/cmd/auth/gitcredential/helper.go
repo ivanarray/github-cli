@@ -120,10 +120,16 @@ func helperRun(opts *CredentialOptions) error {
 	var gotUser string
 	// ActiveTokenWithRefresh refreshes an expired or near-expiry token before
 	// handing it to git; for non-refreshable tokens it is a no-op that just returns them.
-	cred, refreshStatus, _ := cfg.ActiveTokenWithRefresh(lookupHost)
+	cred, refreshStatus, refreshErr := cfg.ActiveTokenWithRefresh(lookupHost)
 	if cred.Token == "" && strings.HasPrefix(lookupHost, "gist.") {
 		lookupHost = strings.TrimPrefix(lookupHost, "gist.")
-		cred, refreshStatus, _ = cfg.ActiveTokenWithRefresh(lookupHost)
+		cred, refreshStatus, refreshErr = cfg.ActiveTokenWithRefresh(lookupHost)
+	}
+
+	// Git only reports that authentication failed, so this is the one place the user can see why. The token is still
+	// handed over below because it may not have expired yet.
+	if refreshStatus == gh.RefreshStatusFailed && refreshErr != nil {
+		fmt.Fprintf(opts.IO.ErrOut, "WARNING: gh: failed to refresh the token for %s: %v\n", lookupHost, refreshErr)
 	}
 
 	// A rejected refresh token can only be recovered by re-authenticating. Notify the user on
@@ -148,8 +154,15 @@ func helperRun(opts *CredentialOptions) error {
 		return cmdutil.SilentError
 	}
 
-	if wants["username"] != "" && gotUser != tokenUser && !strings.EqualFold(wants["username"], gotUser) {
+	// GitHub documents x-access-token as the git username for installation tokens, so a remote may name it. A remote
+	// naming any other account is still refused an app's token.
+	isInstallationToken := strings.HasPrefix(gotToken, string(gh.TokenTypeServerToServer))
+	if wants["username"] != "" && gotUser != tokenUser && !strings.EqualFold(wants["username"], gotUser) &&
+		!(isInstallationToken && wants["username"] == tokenUser) {
 		return cmdutil.SilentError
+	}
+	if isInstallationToken {
+		gotUser = tokenUser
 	}
 
 	// For an expiring, refreshable token we want to stop a caching helper chained in front of gh

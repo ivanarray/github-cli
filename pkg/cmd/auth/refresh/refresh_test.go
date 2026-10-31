@@ -1022,3 +1022,29 @@ func failingRefresher() *ghmock.TokenRefresherMock {
 		},
 	}
 }
+
+func Test_refreshRun_refusesGitHubAppAccount(t *testing.T) {
+	cfg, _ := config.NewIsolatedTestConfig(t, "")
+	future := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err := cfg.Authentication().LoginRefreshable("github.com", "myapp[bot]", gh.Credential{
+		Token:        "ghs_abc",
+		RefreshToken: "ghapp:123:456:/path/to/app.pem",
+		ExpiresAt:    &future,
+	}, "https", false)
+	require.NoError(t, err)
+
+	ios, _, _, _ := iostreams.Test()
+	err = refreshRun(&RefreshOptions{
+		IO:     ios,
+		Config: func() (gh.Config, error) { return cfg, nil },
+		PlainHttpClient: func() (*http.Client, error) {
+			return &http.Client{Transport: &httpmock.Registry{}}, nil
+		},
+		AuthFlow: func(*http.Client, *iostreams.IOStreams, string, []string, bool, bool, bool) (*authflow.AuthResult, error) {
+			t.Error("the browser flow must not start for a GitHub App account")
+			return nil, nil
+		},
+		Hostname: "github.com",
+	})
+	assert.ErrorContains(t, err, "renews the GitHub App token")
+}

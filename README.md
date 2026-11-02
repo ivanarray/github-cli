@@ -1,122 +1,58 @@
-# GitHub CLI
+# GitHub CLI with GitHub App login
 
-GitHub CLI, or the gh CLI, is GitHub on the command line. It brings pull requests, issues, and other GitHub concepts to the terminal next to where you are already working with `git` and your code.
+This is a personal fork of [GitHub CLI](https://github.com/cli/cli) (`gh`). It adds one feature: `gh` can log in as a GitHub App installation and keep working as that app, with the token renewed automatically.
 
-> [!IMPORTANT]
-> GitHub CLI's PGP signing key rotation for Linux package repositories is effective September 5, 2026; users experiencing package installation or update problems can find solutions in the [public announcement](https://github.com/cli/cli/issues/13118).
+Everything else is the upstream `gh`. For general usage see the [original repository](https://github.com/cli/cli) and the [manual](https://cli.github.com/manual/).
 
-![screenshot of gh pr status](https://user-images.githubusercontent.com/98482/84171218-327e7a80-aa40-11ea-8cd1-5177fc2d0e72.png)
+## What this fork adds
 
-GitHub CLI is supported for users on GitHub.com, GitHub Enterprise Cloud, and [supported GitHub Enterprise Server versions](https://docs.github.com/en/enterprise-server/admin/all-releases), with support for macOS, Windows, and Linux.
+Upstream `gh` accepts an installation token (`ghs_...`) through `GH_TOKEN`, but such a token lives one hour and `gh` cannot create or renew it. This fork adds:
 
-## Documentation
+- `gh auth login --app-id <id> --installation-id <id> --private-key-file <path>`: creates an installation token from the app's private key and saves the account as `<app-slug>[bot]`.
+- Automatic renewal: when the token is about to expire, `gh` creates a new one, both for API calls and for git through `gh auth git-credential`.
+- `gh auth status` shows the app account and reports when renewal fails.
+- `gh auth refresh` refuses app accounts, because the browser flow does not apply to them.
 
-For [installation options see below](#installation), for usage instructions [see the manual](https://cli.github.com/manual/).
-
-## Agent skills
-
-An [agent skill](https://agentskills.io) is available for driving `gh` from coding agents. Install or update it with the built-in `gh skill` command:
+## Usage
 
 ```shell
-# Install the skill (user scope recommended)
-gh skill install cli/cli gh --scope user
-
-# Update the skill after a `gh` release
-gh skill update gh
+gh auth login --app-id 123456 --installation-id 7890123 --private-key-file ~/keys/my-app.private-key.pem
+gh auth setup-git   # optional: let git use the app token for HTTPS remotes
+gh auth status
 ```
 
-## Contributing
+`--hostname`, `--git-protocol` and `--insecure-storage` work as with the regular login.
 
-If anything feels off or if you feel that some functionality is missing, please check out the [contributing page](.github/CONTRIBUTING.md). There you will find instructions for sharing your feedback, building the tool locally, and submitting pull requests to the project.
+- **App ID** identifies the app itself. It is shown on the app's settings page.
+- **Installation ID** identifies one installation of the app on an account or organization. It is the number at the end of the installation settings URL, for example `https://github.com/settings/installations/7890123` or `https://github.com/organizations/ORG/settings/installations/7890123`. The token only reaches the repositories and permissions of that installation.
+- **Private key** is the `.pem` file generated on the app's settings page, in the PKCS#1 format GitHub issues.
 
-If you are a hubber and are interested in shipping new commands for the CLI, check out our [doc on internal contributions](docs/working-with-us.md)
+The app account becomes the active account on the host. Use `gh auth switch` to go back to your user.
+
+## How it works
+
+- Only the absolute path to the private key is stored, never the key. If you move or delete the key, renewal stops until you log in again.
+- A failed renewal (missing key, network error, rejected key) does not log you out. `gh` prints a warning and tries again on the next call.
+- For git, the token is sent with the username `x-access-token`. Remotes with no username, `x-access-token` or the bot name work. Remotes naming another user are refused.
+
+## Known limitations
+
+- Commands that need a user (`/user`, `@me`) may not work with an installation token.
+- What the app can do is set by its permissions and the repositories selected for the installation.
+- One app account per host keeps one installation. Logging in with another installation of the same app replaces it.
 
 <!-- this anchor is linked to from elsewhere, so avoid renaming it -->
 ## Installation
 
-### [macOS](docs/install_macos.md)
+Build from source with the Go version declared in [go.mod](go.mod):
 
-- [Homebrew](docs/install_macos.md#homebrew)
-- [Precompiled binaries](docs/install_macos.md#precompiled-binaries) on [releases page][]
-
-For additional macOS packages and installers, see [community-supported docs](docs/install_macos.md#community-unofficial)
-
-### [Linux & Unix](docs/install_linux.md)
-
-- [Debian, Raspberry Pi, Ubuntu](docs/install_linux.md#debian)
-- [Amazon Linux, CentOS, Fedora, openSUSE, RHEL, SUSE](docs/install_linux.md#rpm)
-- [Precompiled binaries](docs/install_linux.md#precompiled-binaries) on [releases page][]
-
-For additional Linux & Unix packages and installers, see [community-supported docs](docs/install_linux.md#community-unofficial)
-
-### [Windows](docs/install_windows.md)
-
-- [WinGet](docs/install_windows.md#winget)
-- [Precompiled binaries](docs/install_windows.md#precompiled-binaries) on [releases page][]
-
-For additional Windows packages and installers, see [community-supported docs](docs/install_windows.md#community-unofficial)
-
-### Build from source
-
-See here on how to [build GitHub CLI from source](docs/install_source.md).
-
-### GitHub Codespaces
-
-To add GitHub CLI to your codespace, add the following to your [devcontainer file](https://docs.github.com/en/codespaces/setting-up-your-project-for-codespaces/adding-features-to-a-devcontainer-file):
-
-```json
-"features": {
-  "ghcr.io/devcontainers/features/github-cli:1": {}
-}
+```shell
+make install prefix=$HOME/.local
+gh --version
 ```
 
-### GitHub Actions
+Make sure `$HOME/.local/bin` comes before any other `gh` in your `PATH`. See [building from source](docs/install_source.md) for details.
 
-[GitHub-hosted runners](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners) have the GitHub CLI pre-installed, which is updated weekly.
+## Upstream
 
-If a specific version is needed, your GitHub Actions workflow will need to install it based on the [macOS](#macos), [Linux & Unix](#linux--unix), or [Windows](#windows) instructions above.
-
-For information on all pre-installed tools, see [`actions/runner-images`](https://github.com/actions/runner-images)
-
-### Verification of binaries
-
-Starting with v2.93.0, releases of `gh` are published as immutable releases. For more information, see [Immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
-
-Since version 2.50.0, `gh` has been producing [Build Provenance Attestation](https://github.blog/changelog/2024-06-25-artifact-attestations-is-generally-available/), enabling a cryptographically verifiable paper-trail back to the origin GitHub repository, git revision, and build instructions used. The build provenance attestations are signed and rely on Public Good [Sigstore](https://www.sigstore.dev/) for PKI.
-
-There are two common ways to verify a downloaded release, depending on whether `gh` is already installed or not. If `gh` is installed, it's trivial to verify a new release:
-
-- **Option 1: Using `gh` if already installed:**
-
-  ```shell
-  $ gh at verify -R cli/cli gh_2.62.0_macOS_arm64.zip
-  Loaded digest sha256:fdb77f31b8a6dd23c3fd858758d692a45f7fc76383e37d475bdcae038df92afc for file://gh_2.62.0_macOS_arm64.zip
-  Loaded 1 attestation from GitHub API
-  ✓ Verification succeeded!
-
-  sha256:fdb77f31b8a6dd23c3fd858758d692a45f7fc76383e37d475bdcae038df92afc was attested by:
-  REPO     PREDICATE_TYPE                  WORKFLOW
-  cli/cli  https://slsa.dev/provenance/v1  .github/workflows/deployment.yml@refs/heads/trunk
-  ```
-
-- **Option 2: Using Sigstore [`cosign`](https://github.com/sigstore/cosign):**
-
-  To perform this, download the [attestation](https://github.com/cli/cli/attestations) for the downloaded release and use cosign to verify the authenticity of the downloaded release:
-
-  ```shell
-  $ cosign verify-blob-attestation --bundle cli-cli-attestation-3120304.sigstore.json \
-        --new-bundle-format \
-        --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-        --certificate-identity="https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk" \
-        gh_2.62.0_macOS_arm64.zip
-  Verified OK
-  ```
-
-## Comparison with hub
-
-For many years, [hub](https://github.com/github/hub) was the unofficial GitHub CLI tool. `gh` is a new project that helps us explore
-what an official GitHub CLI tool can look like with a fundamentally different design. While both
-tools bring GitHub to the terminal, `hub` behaves as a proxy to `git`, and `gh` is a standalone
-tool. Check out our [more detailed explanation](docs/gh-vs-hub.md) to learn more.
-
-[releases page]: https://github.com/cli/cli/releases/latest
+Original project: https://github.com/cli/cli. Releases, packages and support come from there; this fork has no releases of its own.

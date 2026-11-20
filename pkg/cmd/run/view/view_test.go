@@ -2,6 +2,7 @@ package view
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/MakeNowJust/heredoc"
@@ -2759,6 +2761,98 @@ var expectedRunLogOutput = fmt.Sprintf("%s%s", coolJobRunLogOutput, sadJobRunLog
 var expectedRunLogOutputWithNoSteps = fmt.Sprintf("%s%s", coolJobRunWithNoStepLogsLogOutput, sadJobRunWithNoStepLogsLogOutput)
 var expectedLegacyRunLogOutputWithNoSteps = fmt.Sprintf("%s%s", legacyCoolJobRunWithNoStepLogsLogOutput, legacySadJobRunWithNoStepLogsLogOutput)
 
+func TestCopyLogWithLinePrefix(t *testing.T) {
+	longLine := strings.Repeat("x", 70_000)
+	readErr := errors.New("reading log failed")
+	r, w := io.Pipe()
+	require.NoError(t, r.Close())
+	defer w.Close()
+
+	tests := []struct {
+		name    string
+		input   io.Reader
+		writer  io.Writer
+		want    string
+		wantErr error
+	}{
+		{
+			name:   "empty log",
+			input:  strings.NewReader(""),
+			writer: io.Discard,
+		},
+		{
+			name:   "multiple lines",
+			input:  strings.NewReader("first\nsecond\n"),
+			writer: io.Discard,
+			want:   "job\tstep\tfirst\njob\tstep\tsecond\n",
+		},
+		{
+			name:   "empty lines",
+			input:  strings.NewReader("\n\n"),
+			writer: io.Discard,
+			want:   "job\tstep\t\njob\tstep\t\n",
+		},
+		{
+			name:   "CRLF lines",
+			input:  strings.NewReader("first\r\nsecond\r\n"),
+			writer: io.Discard,
+			want:   "job\tstep\tfirst\njob\tstep\tsecond\n",
+		},
+		{
+			name:   "no final newline",
+			input:  strings.NewReader("last"),
+			writer: io.Discard,
+			want:   "job\tstep\tlast\n",
+		},
+		{
+			name:   "final carriage return",
+			input:  strings.NewReader("last\r"),
+			writer: io.Discard,
+			want:   "job\tstep\tlast\n",
+		},
+		{
+			name:   "long line followed by marker",
+			input:  strings.NewReader(longLine + "\nAFTER-LONG-LINE\n"),
+			writer: io.Discard,
+			want:   "job\tstep\t" + longLine + "\njob\tstep\tAFTER-LONG-LINE\n",
+		},
+		{
+			name:   "long line without final newline",
+			input:  strings.NewReader(longLine),
+			writer: io.Discard,
+			want:   "job\tstep\t" + longLine + "\n",
+		},
+		{
+			name:   "long CRLF line",
+			input:  strings.NewReader(longLine + "\r\nAFTER-LONG-LINE\r\n"),
+			writer: io.Discard,
+			want:   "job\tstep\t" + longLine + "\njob\tstep\tAFTER-LONG-LINE\n",
+		},
+		{
+			name:    "read error after partial line",
+			input:   io.MultiReader(strings.NewReader("first\npartial"), iotest.ErrReader(readErr)),
+			writer:  io.Discard,
+			want:    "job\tstep\tfirst\njob\tstep\tpartial\n",
+			wantErr: readErr,
+		},
+		{
+			name:    "write error",
+			input:   strings.NewReader("first\nsecond\n"),
+			writer:  w,
+			wantErr: io.ErrClosedPipe,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := copyLogWithLinePrefix(io.MultiWriter(tt.writer, &buf), tt.input, "job\tstep\t")
+			require.ErrorIs(t, err, tt.wantErr)
+			assert.Equal(t, tt.want, buf.String())
+		})
+	}
+}
+
 func TestCopyLogWithLinePrefix_TerminalEscapeSequences(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -2855,4 +2949,125 @@ func TestRunLog(t *testing.T) {
 		require.NotEmpty(t, zipReader.File)
 		require.Equal(t, "foo", zipReader.File[0].Name)
 	})
+}
+
+func TestViewRun_eventListenHint(t *testing.T) {
+	inProgressRun := shared.TestRunWithCommit(2, shared.InProgress, "", "commit2")
+	completedRun := shared.TestRun(2, shared.Completed, shared.Success)
+	jsonExporter := shared.MakeTestExporter([]string{"status"}, func(io *iostreams.IOStreams, data any) error {
+		fmt.Fprintln(io.Out, "{}")
+		return nil
+	})
+	wantHint := heredoc.Doc(`
+		hint: if you need to wait for the checks of this pull request to finish before continuing, use this instead of polling:
+		    gh event listen --resource https://github.com/OWNER/REPO/pull/2898 --event com.github.pull_request.check_suite.status.changed.v1
+		  - It prints the first event as a JSON line on stdout and exits; run it again to wait for the next one.
+		  - Add ` + "`--timeout`" + ` to stop waiting after a while, for example ` + "`--timeout 30m`" + `; it then exits with status 8.
+		  - Each check suite, such as a workflow run, sends its own event with its conclusion when it completes; after each event, read the checks with ` + "`gh pr checks https://github.com/OWNER/REPO/pull/2898`" + `, and if any are still pending, run the listener again.
+		  - It misses changes made before it starts, so read the checks once it is running.
+		  - See ` + "`gh event listen --help`" + ` for other event types.
+		  - Event subscriptions are in preview and may not be enabled for your account.
+	`)
+
+	tests := []struct {
+		name          string
+		host          string
+		run           shared.Run
+		invokingAgent string
+		exporter      cmdutil.Exporter
+		noPullRequest bool
+		wantStderr    string
+	}{
+		{
+			name:          "agent viewing an in-progress run",
+			run:           inProgressRun,
+			invokingAgent: "copilot-cli",
+			wantStderr:    wantHint,
+		},
+		{
+			name:          "agent viewing an in-progress run as JSON",
+			run:           inProgressRun,
+			invokingAgent: "copilot-cli",
+			exporter:      jsonExporter,
+			wantStderr:    wantHint,
+		},
+		{
+			name:          "agent viewing an in-progress run without a pull request as JSON",
+			run:           inProgressRun,
+			invokingAgent: "copilot-cli",
+			exporter:      jsonExporter,
+			noPullRequest: true,
+		},
+		{
+			name:          "agent viewing an in-progress run on an unsupported host as JSON",
+			host:          "octocorp.ghe.com",
+			run:           inProgressRun,
+			invokingAgent: "copilot-cli",
+			exporter:      jsonExporter,
+		},
+		{
+			name:          "agent viewing a completed run",
+			run:           completedRun,
+			invokingAgent: "copilot-cli",
+		},
+		{
+			name: "user viewing an in-progress run",
+			run:  inProgressRun,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := &httpmock.Registry{}
+			defer reg.Verify(t)
+			reg.Register(
+				httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/2"),
+				httpmock.JSONResponse(tt.run))
+			reg.Register(
+				httpmock.REST("GET", "repos/OWNER/REPO/actions/workflows/123"),
+				httpmock.JSONResponse(shared.TestWorkflow))
+			if tt.exporter == nil || tt.invokingAgent != "" {
+				pullRequests := `{"number": 2898, "headRepository": {"owner": {"login": "OWNER"}, "name": "REPO"}}`
+				if tt.noPullRequest {
+					pullRequests = ""
+				}
+				reg.Register(
+					httpmock.GraphQL(`query PullRequestForRun`),
+					httpmock.StringResponse(`{"data": {"repository": {"pullRequests": {"nodes": [`+pullRequests+`]}}}}`))
+			}
+			if tt.exporter == nil {
+				reg.Register(
+					httpmock.REST("GET", "runs/2/jobs"),
+					httpmock.JSONResponse(shared.JobsPayload{Jobs: []shared.Job{}}))
+				reg.Register(
+					httpmock.REST("GET", "repos/OWNER/REPO/actions/runs/2/artifacts"),
+					httpmock.StringResponse(`{}`))
+			}
+
+			host := tt.host
+			if host == "" {
+				host = "github.com"
+			}
+			ios, _, stdout, stderr := iostreams.Test()
+			opts := &ViewOptions{
+				IO: ios,
+				HttpClient: func() (*http.Client, error) {
+					return &http.Client{Transport: reg}, nil
+				},
+				BaseRepo: func() (ghrepo.Interface, error) {
+					return ghrepo.NewWithHost("OWNER", "REPO", host), nil
+				},
+				Now: func() time.Time {
+					return time.Date(2021, 2, 23, 5, 50, 0, 0, time.UTC)
+				},
+				RunID:         "2",
+				Exporter:      tt.exporter,
+				InvokingAgent: tt.invokingAgent,
+			}
+
+			require.NoError(t, runView(opts))
+			assert.NotEmpty(t, stdout.String())
+			assert.Equal(t, tt.wantStderr, stderr.String())
+		})
+	}
 }

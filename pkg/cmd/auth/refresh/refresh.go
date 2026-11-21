@@ -82,10 +82,11 @@ func NewCmdRefresh(f *cmdutil.Factory, telemetry ghtelemetry.InvocationRecorder,
 
 			Use %[1]s--expiring%[1]s to prefer expiring credentials that gh refreshes automatically, or
 			%[1]s--expiring=false%[1]s to prefer a non-expiring token. This is a preference, not a guarantee:
-			whether expiring tokens are issued depends on the host and the OAuth app configuration. A host
-			without support issues a non-expiring token instead, and a host configured for them may issue
-			expiring tokens even without the flag. Without the flag, refresh keeps the current token's kind,
-			so an expiring token stays expiring and a non-expiring token stays non-expiring.
+			whether expiring tokens are issued depends on the host and the OAuth app configuration.
+			GitHub Enterprise Server requires version 3.23 or later; earlier versions receive a
+			non-expiring token instead. A host configured for them may issue expiring tokens even
+			without the flag. Without the flag, refresh keeps the current token's kind, so an expiring
+			token stays expiring and a non-expiring token stays non-expiring.
 			When using expiring credentials for git operations, git 2.46 or newer is recommended so
 			gh can mark the token as non-cacheable; with older git a credential caching helper may store
 			and reuse an expired token.
@@ -217,8 +218,11 @@ func refreshRun(opts *RefreshOptions) error {
 		//   - Refresh token rejected (expired or revoked): the dead credential is cleared and we proceed to re-auth,
 		//     which re-establishes the credential from scratch.
 		//   - Transient refresh failure or no refresher configured: the token stays as-is and GetScopes may fail.
+		//   - Refresh skipped because the state directory is not writable: the current token is returned with an
+		//     error, but it may still be valid within the refresh window, so we still try to read its scopes.
 		var scopesPreserved bool
-		if oldCredential, _, err := authCfg.ActiveTokenWithRefresh(hostname); err == nil && oldCredential.Token != "" {
+		oldCredential, refreshStatus, err := authCfg.ActiveTokenWithRefresh(hostname)
+		if (err == nil || refreshStatus == gh.RefreshStatusSkipped) && oldCredential.Token != "" {
 			if oldScopes, err := shared.GetScopes(plainHTTPClient, hostname, oldCredential.Token); err == nil {
 				scopesPreserved = true
 				for s := range strings.SplitSeq(oldScopes, ",") {

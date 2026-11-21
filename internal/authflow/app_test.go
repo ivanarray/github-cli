@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,14 +25,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// writeAppKey generates a throwaway RSA key and writes it in the PKCS#1 PEM format GitHub issues. The directory name
+// writeAppKey generates a throwaway RSA key and writes it in the PKCS#1 PEM format GitHub issues. The key path
 // contains a colon to prove key paths survive the colon-separated refresh token.
 func writeAppKey(t *testing.T) (*rsa.PrivateKey, string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	dir := filepath.Join(t.TempDir(), "with:colon")
-	require.NoError(t, os.Mkdir(dir, 0o700))
+	dir := t.TempDir()
+	// Windows forbids colons in file names, and its drive letter already puts one in the path.
+	if runtime.GOOS != "windows" {
+		dir = filepath.Join(dir, "with:colon")
+		require.NoError(t, os.Mkdir(dir, 0o700))
+	}
 	path := filepath.Join(dir, "app.pem")
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	require.NoError(t, os.WriteFile(path, keyPEM, 0o600))
